@@ -1,101 +1,131 @@
 import os
 import json
-import fitz  # PyMuPDF
-from tqdm import tqdm
-from transformers import AutoTokenizer
+import re
+import fitz
 
-# ---------------------------
-# Config
-# ---------------------------
 PAPERS_DIR = "data/papers"
 OUTPUT_PATH = "data/chunks.json"
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-CHUNK_SIZE = 700        # tokens
-CHUNK_OVERLAP = 100     # tokens
-
-# ---------------------------
-# Initialize Tokenizer
-# ---------------------------
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+CHUNK_WORDS = 200
+OVERLAP_WORDS = 40
 
 
-def extract_text_from_pdf(pdf_path):
-    """Extract text page by page with metadata."""
-    doc = fitz.open(pdf_path)
-    pages = []
-
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        text = page.get_text()
-        text = text.replace("\n", " ").strip()
-
-        if len(text) > 50:  # ignore very small fragments
-            pages.append({
-                "text": text,
-                "page_number": page_num + 1
-            })
-
-    return pages
+# -------------------------------------------------
+# CLEAN TEXT (PRESERVE NEWLINES INITIALLY)
+# -------------------------------------------------
+def clean_text(text):
+    # Normalize spacing but KEEP line breaks
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s+", "\n", text)
+    text = re.sub(r"\s+\n", "\n", text)
+    return text.strip()
 
 
-def chunk_text(text, chunk_size=700, overlap=100):
-    """Token-aware chunking."""
-    tokens = tokenizer.encode(text)
+# -------------------------------------------------
+# WORD-BASED CHUNKING
+# -------------------------------------------------
+def chunk_by_words(text, chunk_size=200, overlap=40):
+    words = text.split()
     chunks = []
 
     start = 0
-    while start < len(tokens):
+    while start < len(words):
         end = start + chunk_size
-        chunk_tokens = tokens[start:end]
-        chunk_text = tokenizer.decode(chunk_tokens)
+        chunk_words = words[start:end]
 
-        chunks.append(chunk_text)
+        if len(chunk_words) > 50:
+            chunk_text = " ".join(chunk_words)
+            chunks.append(chunk_text)
 
         start += chunk_size - overlap
 
     return chunks
 
 
+# -------------------------------------------------
+# MAIN PROCESSING
+# -------------------------------------------------
 def process_papers():
     all_chunks = []
     chunk_id = 0
 
-    for filename in tqdm(os.listdir(PAPERS_DIR)):
+    for filename in os.listdir(PAPERS_DIR):
         if not filename.endswith(".pdf"):
             continue
 
         pdf_path = os.path.join(PAPERS_DIR, filename)
         paper_title = filename.replace(".pdf", "")
 
-        pages = extract_text_from_pdf(pdf_path)
+        doc = fitz.open(pdf_path)
+        full_text = ""
 
-        for page in pages:
-            chunks = chunk_text(page["text"], CHUNK_SIZE, CHUNK_OVERLAP)
+        for page in doc:
+            full_text += page.get_text() + "\n"
 
-            for chunk in chunks:
-                all_chunks.append({
-                    "chunk_id": f"chunk_{chunk_id}",
-                    "text": chunk,
-                    "paper_title": paper_title,
-                    "page_number": page["page_number"]
-                })
-                chunk_id += 1
+        print("RAW LENGTH:", len(full_text))
+
+        # Clean spacing but keep structure
+        full_text = clean_text(full_text)
+        print("AFTER CLEAN LENGTH:", len(full_text))
+
+        # -------------------------------------------------
+        # SAFE REFERENCE REMOVAL
+        # -------------------------------------------------
+        ref_match = re.search(r"\nReferences\s*\n", full_text, flags=re.IGNORECASE)
+
+        if ref_match and ref_match.start() > len(full_text) * 0.6:
+            full_text = full_text[:ref_match.start()]
+
+        print("AFTER REF REMOVAL LENGTH:", len(full_text))
+
+        # -------------------------------------------------
+        # REMOVE FIGURE CAPTIONS (SAFE VERSION)
+        # -------------------------------------------------
+        full_text = re.sub(
+            r"\nFigure\s+\d+.*",
+            "",
+            full_text,
+            flags=re.IGNORECASE
+        )
+
+        # -------------------------------------------------
+        # REMOVE INLINE CITATIONS [123]
+        # -------------------------------------------------
+        full_text = re.sub(r"\[\d+\]", "", full_text)
+
+        # -------------------------------------------------
+        # NOW FLATTEN TEXT FOR CHUNKING
+        # -------------------------------------------------
+        full_text = re.sub(r"\n+", " ", full_text)
+
+        print("TOTAL WORDS:", len(full_text.split()))
+
+        # -------------------------------------------------
+        # CHUNK
+        # -------------------------------------------------
+        chunks = chunk_by_words(full_text, CHUNK_WORDS, OVERLAP_WORDS)
+
+        for chunk in chunks:
+            all_chunks.append({
+                "chunk_id": f"chunk_{chunk_id}",
+                "text": chunk,
+                "paper_title": paper_title
+            })
+            chunk_id += 1
 
     return all_chunks
 
 
+# -------------------------------------------------
+# ENTRY POINT
+# -------------------------------------------------
 if __name__ == "__main__":
-    print("Processing papers...")
+    print("Processing paper...")
     chunks = process_papers()
 
-    print(f"\nTotal chunks created: {len(chunks)}\n")
-
-    if len(chunks) > 0:
-        print("Sample chunk:\n")
-        print(json.dumps(chunks[0], indent=2)[:1000])
+    print(f"Total chunks: {len(chunks)}")
 
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         json.dump(chunks, f, indent=2)
 
-    print(f"\nChunks saved to {OUTPUT_PATH}")
+    print("Chunks saved.")
